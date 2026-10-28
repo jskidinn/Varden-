@@ -16,6 +16,7 @@
      restored from the menu. Every change is written to a log you can read.
     ===========================================================================
 #>
+# Varden-Self-ID 8831f2a9c4  -  this marker lets Varden recognise its own file and never flag itself as malware.
 param(
     [ValidateSet('Quick', 'Full', 'Custom', 'Menu')]
     [string]$Scan = 'Menu',
@@ -60,7 +61,12 @@ $QLog      = Join-Path $Root 'quarantine-log.txt'
 $ChangeLog = Join-Path $Root 'changes-log.txt'
 New-Item -ItemType Directory -Force -Path $QDir | Out-Null
 
-$Exclusions = @(@($Root, "$env:SystemDrive\SimpleMalwareScanner") | ForEach-Object { "$_".Trim().TrimEnd('\') } | Where-Object { $_ })
+$Exclusions = @(@($Root, "$env:ProgramData\MALWAREA", "$env:SystemDrive\SimpleMalwareScanner",
+    (Join-Path $env:TEMP 'Varden.ps1'), (Join-Path $env:TEMP 'MALWAREA.ps1'), (Join-Path $env:TEMP 'engine.ps1')) |
+    ForEach-Object { "$_".Trim().TrimEnd('\') } | Where-Object { $_ })
+# Varden's own files - never report these as malware, wherever they are
+$script:SelfNames = @('varden.ps1', 'malwarea.ps1', 'engine.ps1', 'run-varden.bat', 'run-malwarea.bat', 'varden.exe', 'malwarea.exe')
+$script:SelfTag   = 'Varden-Self-ID 8831f2a9c4' 
 $script:NThreat = 0
 $script:NSus    = 0
 $script:FileCount = 0
@@ -105,12 +111,24 @@ $StatusMap = @{ 0='Unknown'; 1='Detected'; 2='Cleaned'; 3='Quarantined'; 4='Remo
 # =====================================================================
 function Write-Log([string]$Text) { Add-Content -Path $ChangeLog -Value ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Text) }
 
+# True if a file is one of Varden's own files (by name, by folder, or by the self-ID marker inside it)
+function Test-IsSelf([string]$p) {
+    if (-not $p) { return $false }
+    if ($SelfPath -and $p -eq $SelfPath) { return $true }
+    $name = (($p -split '[\\/]')[-1]).ToLower()
+    if ($script:SelfNames -and ($script:SelfNames -contains $name)) { return $true }
+    foreach ($e in $Exclusions) { if ($e -and $p.StartsWith($e, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    if ($script:SelfTag -and $p -match '(?i)\.(ps1|psm1|bat|cmd|txt)$') {
+        try { if ((Test-Path -LiteralPath $p -PathType Leaf) -and (Select-String -LiteralPath $p -SimpleMatch $script:SelfTag -Quiet -ErrorAction Stop)) { return $true } } catch {}
+    }
+    return $false
+}
+
 function Add-Finding($Level, $Area, $Text, $Fix) {
     if ($Fix -and $Fix.Files) {
         foreach ($f in @($Fix.Files)) {
             if (-not $f) { continue }
-            if ($SelfPath -and $f -eq $SelfPath) { return }                       # never report Varden itself
-            foreach ($e in $Exclusions) { if ($e -and $f.StartsWith($e, [StringComparison]::OrdinalIgnoreCase)) { return } }
+            if (Test-IsSelf $f) { return }                                         # never report Varden's own files
         }
     }
     [void]$script:Findings.Add([pscustomobject]@{ Level = $Level; Area = $Area; Text = $Text; Fix = $Fix; Result = ''; Hashes = @() })
@@ -1527,51 +1545,72 @@ function Check-Usb {
 #  Traces of recent attacks (event logs, earlier detections)
 # =====================================================================
 function Check-History {
+    # Microsoft Defender's own past detections - but collapse duplicates and ignore Varden's own files
     $threats = @{}
     foreach ($t in @(Get-MpThreat)) { $threats[[string]$t.ThreatID] = $t }
-    $since = (Get-Date).AddDays(-30)
-    $n = 0
-    foreach ($d in @(Get-MpThreatDetection | Where-Object { $_ -and $_.InitialDetectionTime -ge $since -and $_.InitialDetectionTime -lt $script:ScanStart } | Sort-Object InitialDetectionTime -Descending)) {
+    $since = (Get-Date).AddDays(-14)
+    $groups = @{}
+    foreach ($d in @(Get-MpThreatDetection | Where-Object { $_ -and $_.InitialDetectionTime -ge $since -and $_.InitialDetectionTime -lt $script:ScanStart })) {
         $t = $threats[[string]$d.ThreatID]
-        if ($t -and $t.IsActive) { continue }    # still active ones are reported by the virus scan
-        $n++; if ($n -gt 10) { break }
-        $name = if ($t) { $t.ThreatName } else { "Threat ID $($d.ThreatID)" }
-        Add-Finding 'WARNING' 'Past detection' ("{0:yyyy-MM-dd}: Microsoft Defender found {1} ({2})`n       {3}" -f $d.InitialDetectionTime, $name, "$($StatusMap[[int]$d.ThreatStatusID])".ToLower(), (@($d.Resources) -join "`n       ")) $null
+        if ($t -and $t.IsActive) { continue }                      # active ones are handled by the live scan
+        $res = (@($d.Resources) -join ' ')
+        if ($res -match '(?i)(Varden|MALWAREA|SimpleMalwareScanner|\engine\.ps1)') { continue }   # our own tool, not a real threat
+        $name = if ($t) { $t.ThreatName } else { "Threat $($d.ThreatID)" }
+        if (-not $groups.ContainsKey($name)) { $groups[$name] = @{ Count = 0; Last = $d.InitialDetectionTime } }
+        $groups[$name].Count++
+        if ($d.InitialDetectionTime -gt $groups[$name].Last) { $groups[$name].Last = $d.InitialDetectionTime }
     }
+    foreach ($name in $groups.Keys) {
+        $g = $groups[$name]
+        $times = if ($g.Count -gt 1) { "$($g.Count) times, most recently $($g.Last.ToString('yyyy-MM-dd'))" } else { $g.Last.ToString('yyyy-MM-dd') }
+        Add-Finding 'WARNING' 'Past detection' ("Microsoft Defender already caught and removed {0} ($times). Nothing to do now - this is just history." -f $name) $null
+    }
+
+    # Suspicious PowerShell in the logs - ONLY if the logged code really looks malicious (not Windows' own background scripts)
     try {
-        $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-PowerShell/Operational'; Id = 4104; Level = 3; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 300 -ErrorAction Stop
-        $n = 0
+        $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-PowerShell/Operational'; Id = 4104; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 400 -ErrorAction Stop
+        $seen = @{}; $n = 0
         foreach ($e in $ev) {
             $text = [string]$e.Properties[2].Value
             $spath = [string]$e.Properties[4].Value
-            if ($spath -and ($spath -like "$Root*" -or $spath -like '*SimpleMalwareScanner*')) { continue }
-            if ($text -match 'MwNative|Varden|MALWAREA|SimpleMalwareScanner|Check-Autoruns') { continue }
-            $n++; if ($n -gt 5) { break }
-            $one = ($text -replace '\s+', ' ').Trim()
-            $one = $one.Substring(0, [Math]::Min(180, $one.Length))
+            if (-not ($text -match $BadCmd)) { continue }                              # must contain a real malware command, not just any flagged script
+            if ($text -match '(?i)(Varden|MALWAREA|SimpleMalwareScanner|__cmdletization|CmdletizationCore|Microsoft\.PowerShell\.Core|root/standard|PSReadLine|chocolatey|winget|scoop)') { continue }
+            if ($spath -and (Test-IsSelf $spath)) { continue }
+            if ($spath -and ($spath -like "$env:windir\*")) { continue }
+            $key = if ($spath) { $spath } else { $text.Substring(0, [Math]::Min(60, $text.Length)) }
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = 1; $n++; if ($n -gt 5) { break }
+            $one = (($text -replace '\s+', ' ').Trim()); $one = $one.Substring(0, [Math]::Min(160, $one.Length))
             $from = if ($spath) { " ($spath)" } else { '' }
-            $files = @(@($spath) | Where-Object { $_ -and (Test-Path -LiteralPath $_) -and $_ -notlike "$env:windir\*" })
+            $files = @(@($spath) | Where-Object { $_ -and (Test-Path -LiteralPath $_) -and -not (Test-IsSelf $_) -and $_ -notlike "$env:windir\*" })
             $fix = if ($files.Count) { @{ Type = 'None'; Files = $files; Desc = 'Quarantine the script' } } else { $null }
-            Add-Finding 'SUSPICIOUS' 'Script activity' ("{0:yyyy-MM-dd HH:mm}: Windows flagged a suspicious PowerShell script{1}:`n       {2}" -f $e.TimeCreated, $from, $one) $fix
+            Add-Finding 'SUSPICIOUS' 'Suspicious PowerShell' ("{0:yyyy-MM-dd HH:mm}: a hidden/download command was run{1}:`n       {2}" -f $e.TimeCreated, $from, $one) $fix
         }
     } catch {}
+
+    # Newly-installed services - only flag if the PROGRAM FILE (not its log paths) is in a user folder and unsigned
     try {
         foreach ($e in Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7045; StartTime = (Get-Date).AddDays(-14) } -MaxEvents 200 -ErrorAction Stop) {
             $svc = [string]$e.Properties[0].Value
             $img = [string]$e.Properties[1].Value
-            if ($img -notmatch $UserWritable -and $img -notmatch $BadCmd) { continue }
+            $exe = $img.Trim()
+            if ($exe.StartsWith('"')) { $exe = $exe.Substring(1); $exe = $exe.Substring(0, $exe.IndexOf('"')) }
+            else { $exe = ($exe -split '\s+')[0] }
+            $exe = [Environment]::ExpandEnvironmentVariables($exe)
+            $bad = ($img -match $BadCmd) -or ($exe -match $UserWritable -and (Test-Path -LiteralPath $exe) -and -not (Test-Signed $exe))
+            if (-not $bad) { continue }
             Add-Finding 'SUSPICIOUS' 'New service' ("{0:yyyy-MM-dd HH:mm}: service '{1}' was installed and runs: {2}" -f $e.TimeCreated, $svc, $img) `
-                @{ Type = 'Service'; Name = $svc; Files = (Test-Command $img).Files; Desc = 'Stop + disable it, quarantine its file' }
+                @{ Type = 'Service'; Name = $svc; Files = @(@($exe) | Where-Object { $_ -match $UserWritable -and (Test-Path -LiteralPath $_) }); Desc = 'Stop + disable it, quarantine its file' }
         }
     } catch {}
+
     try {
-        $c = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 104; StartTime = (Get-Date).AddDays(-30) } -MaxEvents 3 -ErrorAction Stop)
-        if ($c.Count) {
-            Add-Finding 'WARNING' 'Event log' ("A Windows event log was cleared on {0:yyyy-MM-dd}. Attackers do this to hide their tracks (cleanup tools do it too)." -f $c[0].TimeCreated) $null
+        $cl = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 104; StartTime = (Get-Date).AddDays(-30) } -MaxEvents 3 -ErrorAction Stop)
+        if ($cl.Count) {
+            Add-Finding 'WARNING' 'Event log' ("A Windows event log was cleared on {0:yyyy-MM-dd}. Attackers sometimes do this to hide tracks (but cleanup tools do it too)." -f $cl[0].TimeCreated) $null
         }
     } catch {}
 }
-
 # =====================================================================
 #  Console front-end  (minimalist, shows everything it does)
 # =====================================================================
@@ -1683,21 +1722,39 @@ function Run-Scan([string]$Mode) {
     $took = (Get-Date) - $started
     Log ("DONE files=$($script:FileCount) remove=$g1 check=$g2 note=$g3 total=$($script:List.Count)")
 
-    # ---- verdict ----
+    # ---- remove the REAL threats automatically (no need to ask) ----
+    $removed = 0; $failed = 0
+    foreach ($f in @($script:List | Where-Object { $_.Group -eq 1 -and $_.Fix -and -not $_.Result })) {
+        try { Invoke-Fix $f; $f.Result = 'FIXED'; $removed++ } catch { $f.Result = "FAILED: $($_.Exception.Message)"; $failed++ }
+    }
+
+    # ---- verdict (spaced out so it is easy to read) ----
+    Write-Host ''
     Write-Host ''
     Line '='
+    Write-Host ''
     if ($g1 -gt 0) {
-        Write-Host ("   [!]  ACTION NEEDED  -  {0} real threat(s) you should remove" -f $g1) -ForegroundColor Red
+        Write-Host ("      {0} REAL THREAT(S) FOUND  -  removed automatically" -f $g1) -ForegroundColor Red
     } elseif ($g2 -gt 0) {
-        Write-Host ("   [~]  no confirmed threats  -  {0} item(s) worth a quick look" -f $g2) -ForegroundColor Yellow
+        Write-Host '      NO REAL THREATS FOUND' -ForegroundColor Green
     } else {
-        Write-Host '   [OK]  YOUR COMPUTER LOOKS SAFE  -  nothing dangerous was found' -ForegroundColor Green
+        Write-Host '      YOUR COMPUTER LOOKS SAFE' -ForegroundColor Green
     }
+    Write-Host ''
     Line '='
-    Write-Host ("   {0} to remove   .   {1} to check   .   {2} notes   .   {3:N0} files checked   .   {4:mm\:ss}" -f $g1, $g2, $g3, $script:FileCount, $took) -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host ("      Files checked       {0:N0}" -f $script:FileCount) -ForegroundColor Gray
+    Write-Host ("      Threats removed     {0}" -f $removed) -ForegroundColor Gray
+    if ($failed) { Write-Host ("      Could not remove    {0}   (shown in the list below)" -f $failed) -ForegroundColor Red }
+    Write-Host ("      Left for you to check  {0}" -f $g2) -ForegroundColor Gray
+    Write-Host ("      Notes               {0}" -f $g3) -ForegroundColor Gray
+    Write-Host ("      Time taken          {0:mm\:ss}" -f $took) -ForegroundColor Gray
+    Write-Host ''
+    Write-Host ''
 
     Show-Results
-    try { if ($script:NThreat -gt 0) { [Media.SystemSounds]::Exclamation.Play() } else { [Media.SystemSounds]::Asterisk.Play() } } catch {}
+    try { if ($g1 -gt 0) { [Media.SystemSounds]::Exclamation.Play() } else { [Media.SystemSounds]::Asterisk.Play() } } catch {}
+    if ($removed -gt 0) { Write-Host ("   The $removed real threat(s) are now in quarantine - restore them from the menu (option 3) if you ever need to." ) -ForegroundColor Green; Write-Host '' }
     Ask-And-Fix
     Save-Report $Mode $started
 }
@@ -1724,39 +1781,42 @@ function Show-Results {
         if (-not $items.Count) { continue }
         $gi = $script:GroupInfo[$g]
         Write-Host ''
+        Write-Host ''
         Line '-'
-        Write-Host ("   {0}" -f $gi.Head) -ForegroundColor $gi.Color
-        Write-Host ("   {0}" -f $gi.Advice) -ForegroundColor DarkGray
+        Write-Host ("    " + $gi.Head) -ForegroundColor $gi.Color
+        Write-Host ("    " + $gi.Advice) -ForegroundColor DarkGray
         Line '-'
+        Write-Host ''
         foreach ($f in $items) {
             $num++
-            Write-Host ("   {0,2}. [{1}]  {2}" -f $num, $gi.Tag.Trim(), $f.Area) -ForegroundColor $gi.Color
-            foreach ($ln in ($f.Text -split "`n")) { if ($ln.Trim()) { Write-Host ('        ' + $ln.Trim()) -ForegroundColor Gray } }
-            foreach ($h in $f.Hashes) { Write-Host ('        check this file online:  https://www.virustotal.com/gui/file/' + ($h.Split(' ')[0])) -ForegroundColor DarkGray }
-            if ($f.Fix) { Write-Host ('        if removed: ' + $f.Fix.Desc) -ForegroundColor DarkGray } else { Write-Host '        (nothing to remove - information only)' -ForegroundColor DarkGray }
+            $tag  = if ($f.Result -eq 'FIXED') { 'REMOVED' } else { $gi.Tag.Trim() }
+            $tcol = if ($f.Result -eq 'FIXED') { 'Green' } else { $gi.Color }
+            Write-Host ("    {0,2}.  [{1}]  {2}" -f $num, $tag, $f.Area) -ForegroundColor $tcol
+            foreach ($ln in ($f.Text -split "`n")) { if ($ln.Trim()) { Write-Host ('         ' + $ln.Trim()) -ForegroundColor Gray } }
+            foreach ($h in $f.Hashes) { Write-Host ('         look it up:  virustotal.com/gui/file/' + ($h.Split(' ')[0])) -ForegroundColor DarkGray }
+            if ($f.Result -eq 'FIXED') { Write-Host '         -> removed and moved to quarantine' -ForegroundColor Green }
+            elseif ($f.Result -like 'FAILED*') { Write-Host ('         -> could not remove: ' + ($f.Result -replace '^FAILED:\s*', '')) -ForegroundColor Red }
+            elseif ($f.Fix) { Write-Host ('         if you remove it: ' + $f.Fix.Desc) -ForegroundColor DarkGray }
+            else { Write-Host '         (information only - nothing to delete)' -ForegroundColor DarkGray }
             Write-Host ''
         }
     }
 }
 
 function Ask-And-Fix {
-    $fixable = @(); for ($i = 0; $i -lt $script:List.Count; $i++) { if ($script:List[$i].Fix) { $fixable += ($i + 1) } }
-    if (-not $fixable.Count) { return }
-    $threats = @($fixable | Where-Object { $script:List[$_ - 1].Group -eq 1 })
+    # the real threats are already removed automatically - this only asks about the CHECK items
+    $remaining = @(); for ($i = 0; $i -lt $script:List.Count; $i++) { if ($script:List[$i].Fix -and -not $script:List[$i].Result) { $remaining += ($i + 1) } }
+    if (-not $remaining.Count) { return }
+    Line '-'
+    Write-Host '   The CHECK items above are your decision:' -ForegroundColor White
+    Write-Host '     keep the ones you recognise (your games, apps, drivers)' -ForegroundColor DarkGray
+    Write-Host '     remove the ones you do NOT recognise' -ForegroundColor DarkGray
+    Write-Host '   Anything you remove goes to quarantine and can be restored.' -ForegroundColor DarkGray
     Write-Host ''
-    Write-Host '   WHAT TO DO:' -ForegroundColor White
-    Write-Host '     REMOVE items  ->  delete them (recommended).' -ForegroundColor DarkGray
-    Write-Host '     CHECK items   ->  keep what you recognise, remove what you do not.' -ForegroundColor DarkGray
-    Write-Host '     NOTE items    ->  usually leave alone.' -ForegroundColor DarkGray
-    Write-Host '   Everything removed goes to quarantine and can be restored later.' -ForegroundColor DarkGray
-    Write-Host ''
-    $prompt = if ($threats.Count) { "   Remove what?  [R] the $($threats.Count) real threat(s) (recommended)   [A]ll   numbers (e.g. 2,5)   Enter = skip" }
-              else { "   Remove what?  [A]ll flagged   numbers (e.g. 2,5)   Enter = skip" }
-    $ans = Read-Host $prompt
+    $ans = Read-Host ("   Remove any of these? type their number(s), e.g. $($remaining[0])   -   or press Enter to keep them all")
     $pick = @()
-    if ($ans -match '^\s*[rR]\s*$') { $pick = $threats }
-    elseif ($ans -match '^\s*[aA]\s*$') { $pick = $fixable }
-    elseif ($ans) { foreach ($s in ($ans -split '[,\s]+')) { $n = 0; if ([int]::TryParse($s, [ref]$n) -and $fixable -contains $n) { $pick += $n } } }
+    if ($ans -match '^\s*[aA]\s*$') { $pick = $remaining }
+    elseif ($ans) { foreach ($s in ($ans -split '[,\s]+')) { $n = 0; if ([int]::TryParse($s, [ref]$n) -and $remaining -contains $n) { $pick += $n } } }
     foreach ($n in ($pick | Select-Object -Unique)) {
         $f = $script:List[$n - 1]
         try { Invoke-Fix $f; $f.Result = 'FIXED'; Write-Host "   [$n] removed and quarantined" -ForegroundColor Green }
